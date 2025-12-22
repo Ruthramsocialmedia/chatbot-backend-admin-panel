@@ -10,11 +10,11 @@ const app = express();
 app.use(cors({ origin: "*" })); // In production, restrict origin
 app.use(express.json());
 
-// DEBUG: Log all requests
-app.use((req, res, next) => {
-  console.log(`[DEBUG] Received: ${req.method} ${req.url}`);
-  next();
-});
+// DEBUG: Log all requests (Disabled for Production)
+// app.use((req, res, next) => {
+//   console.log(`[DEBUG] Received: ${req.method} ${req.url}`);
+//   next();
+// });
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "Montfort Chatbot backend running" });

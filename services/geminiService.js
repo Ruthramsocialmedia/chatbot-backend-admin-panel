@@ -6,94 +6,73 @@
 // - School-safe fallback
 // - Embeddings for semantic search
 
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { ENV } from "../config/env.js";
-import readline from "readline";
+import { fileURLToPath } from "url";
+import { supabaseAdmin } from "./supabaseService.js";
 
-const BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
+const genAI = new GoogleGenerativeAI(ENV.GEMINI_API_KEY);
+const CHAT_MODEL = ENV.GEMINI_MODEL || "gemini-flash-latest";
 const EMBED_MODEL = "text-embedding-004";
-const CHAT_MODEL = ENV.GEMINI_MODEL || "gemini-1.5-flash";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Vocabulary file used for word-split + local spell-fix
-const VOCAB_PATH = path.join(
-  __dirname,
-  "..",
-  "rag",
-  "school-data-understood.jsonl"  // FIXED: Changed from .json to .jsonl
-);
 
 let VOCAB_SET = null;
 let VOCAB_WORDS = null;
 
 /* ---------------------------------------------------------
-   LOAD VOCAB (for local spell-fix & word split) - STREAM FIXED
+   LOAD VOCAB (from Database)
 --------------------------------------------------------- */
 async function loadVocabOnce() {
   if (VOCAB_SET) return;
 
   try {
-    const isJSONL = VOCAB_PATH.endsWith(".jsonl");
     const set = new Set();
 
-    if (isJSONL) {
-      // ✅ FIX: Stream JSONL line by line
-      const rl = readline.createInterface({
-        input: fs.createReadStream(VOCAB_PATH),
-        crlfDelay: Infinity
-      });
+    // Fetch Questions
+    const { data: questions, error: qError } = await supabaseAdmin
+      .from('questions')
+      .select('question_text');
 
-      for await (const line of rl) {
-        if (!line.trim()) continue;
-        
-        try {
-          const item = JSON.parse(line);
-          const text = `${item.keyword || ""} ${item.question || ""}`;
-          text
-            .toLowerCase()
-            .replace(/[^a-z0-9\s]/g, " ")
-            .split(/\s+/)
-            .filter(Boolean)
-            .forEach((t) => {
-              if (t.length >= 3) set.add(t);
-            });
-        } catch (err) {
-          console.warn("[GeminiService] Skipping invalid JSONL line:", line.substring(0, 100));
-        }
-      }
-    } else {
-      // ✅ FIX: Keep backward compatibility for .json
-      const data = JSON.parse(fs.readFileSync(VOCAB_PATH, "utf8"));
-      
-      for (const item of data) {
-        const text = `${item.keyword || ""} ${item.question || ""}`;
-        text
-          .toLowerCase()
-          .replace(/[^a-z0-9\s]/g, " ")
-          .split(/\s+/)
-          .filter(Boolean)
-          .forEach((t) => {
-            if (t.length >= 3) set.add(t);
-          });
-      }
+    if (qError) console.error("[GeminiService] Error fetching questions:", qError);
+    else {
+      questions?.forEach(q => {
+        processTextToVocab(q.question_text, set);
+      });
+    }
+
+    // Fetch Intents
+    const { data: intents, error: iError } = await supabaseAdmin
+      .from('intents')
+      .select('name');
+
+    if (iError) console.error("[GeminiService] Error fetching intents:", iError);
+    else {
+      intents?.forEach(i => {
+        processTextToVocab(i.name, set);
+      });
     }
 
     VOCAB_SET = set;
     VOCAB_WORDS = Array.from(set);
     console.log(
-      `[GeminiService] Loaded ${VOCAB_WORDS.length} vocabulary words.`
+      `[GeminiService] Loaded ${VOCAB_WORDS.length} vocabulary words from DB.`
     );
   } catch (err) {
     console.error("[GeminiService] Failed to load vocabulary:", err);
-    // ✅ FIX: Ensure fallback doesn't break downstream
     VOCAB_SET = new Set();
     VOCAB_WORDS = [];
-    return; // Explicit return on failure
   }
+}
+
+function processTextToVocab(text, set) {
+  if (!text) return;
+  text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .forEach((t) => {
+      if (t.length >= 3) set.add(t);
+    });
 }
 
 /* ---------------------------------------------------------
@@ -123,45 +102,46 @@ function levenshtein(a, b) {
 /* ---------------------------------------------------------
    CORE GEMINI CALLER
 --------------------------------------------------------- */
+/* ---------------------------------------------------------
+   CORE GEMINI CALLER (SDK Version)
+--------------------------------------------------------- */
+const COOLDOWN_MS = 60 * 1000; // 1 minute cooldown
+let last429Time = 0;
+
 async function callGemini(prompt, instruction = "") {
+  // CIRCUIT BREAKER: Check cooldown
+  if (Date.now() - last429Time < COOLDOWN_MS) {
+    console.warn("[Gemini] Circuit Breaker Active. Skipping call (cooling down).");
+    return "";
+  }
+
   if (!ENV.GEMINI_API_KEY) return "";
 
   try {
-    const res = await fetch(
-      `${BASE_URL}/${CHAT_MODEL}:generateContent?key=${ENV.GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: instruction
-                    ? `${instruction}\n\nUSER: ${prompt}`
-                    : prompt,
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.1, // stable, not creative
-            maxOutputTokens: 180,
-          },
-        }),
-      }
-    );
+    const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
 
-    if (!res.ok) {
-      console.error("[Gemini] HTTP error:", res.status);
+    // Construct prompt with instruction
+    const userPrompt = instruction
+      ? `${instruction}\n\nUSER: ${prompt}`
+      : prompt;
+
+    const result = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 1000,
+      }
+    });
+
+    const response = await result.response;
+    return response.text().trim();
+  } catch (err) {
+    if (err.message && (err.message.includes("429") || err.message.includes("Quota exceeded"))) {
+      console.warn(`[Gemini] Rate Limit (429) Hit. Activating Circuit Breaker for ${COOLDOWN_MS / 1000}s.`);
+      last429Time = Date.now();
       return "";
     }
-
-    const data = await res.json();
-    return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-  } catch (err) {
-    console.error("[Gemini] callGemini error:", err);
+    console.error("[Gemini] callGemini error:", err.message);
     return "";
   }
 }
@@ -345,66 +325,88 @@ Return ONLY the corrected sentence, nothing else.
    EXPORT: MEANING NORMALIZER
    Rewrites into a clean English question, preserving meaning.
 --------------------------------------------------------- */
+/* ---------------------------------------------------------
+   EXPORT: MEANING NORMALIZER
+   Rewrites into a clean English question, preserving meaning.
+--------------------------------------------------------- */
 export async function normalizeToMeaning(text) {
   if (!text) return "";
 
   const cleaned = preClean(text);
   const tokens = cleaned.split(/\s+/).filter(Boolean);
-  const nounCandidates = tokens.filter((t) => t.length > 3);
 
-  // If too short → don't risk rewrite
-  if (tokens.length <= 3) return cleaned;
+  // If too short → don't risk rewrite unless it looks like a keyword query
+  if (tokens.length <= 1) return cleaned;
 
   const inst = `
-Rewrite the user's message as a clean English QUESTION.
+You are an expert spell checker for a school chatbot.
+Correct the spelling and grammar of the user's query.
 
-VERY IMPORTANT:
-You must NOT change the user's meaning under ANY condition.
+INPUT: "${cleaned}"
 
-STRICT RULES (DO NOT BREAK):
-1. DO NOT change or replace ANY noun.
-2. DO NOT introduce ANY new noun or verb.
-3. DO NOT guess the user's meaning or intention.
-4. DO NOT remove important words.
-5. DO NOT change the action:
-   - follow
-   - break
-   - obey
-   - allow
-   - rules
-6. DO NOT change words like:
-   - what
-   - if
-   - happen / happens
-   - did / did not / didn't
-7. You may ONLY:
-   - Add helper words ("the", "does", "do", "is", "are")
-   - Fix tiny grammar issues
-   - Reorder existing words WITHOUT changing meaning
+RULES:
+1. Fix typos (e.g. "wesiet" -> "website", "scol" -> "school").
+2. DO NOT change the structure of the sentence.
+3. DO NOT rewrite keywords into full questions.
+   - "contact detaikls" -> "contact details" (NOT "What are the contact details?")
+   - "fees pay" -> "fees payment" (NOT "How do I pay fees?")
+4. Preserve the user's intent and specific words.
 
-If the sentence is too unclear to safely rewrite,
-RETURN the cleaned version as-is.
-
-These words represent important concepts and MUST stay the SAME CONCEPT:
-${nounCandidates.join(
-  ", "
-)}, follow, rule, rules, break, obey, happen, happens, did, didn't, "did not"
-
-Return ONLY the meaning-preserved corrected question, one sentence, no explanation.
+Return ONLY the corrected text.
 `;
 
   try {
     const out = await callGemini(cleaned, inst);
     if (!out) return cleaned;
-
-    const result = out.trim();
-
-    // Safety check: output must not be too short
-    if (result.split(/\s+/).length <= 3) return cleaned;
-
-    return result;
-  } catch {
+    return out.trim();
+  } catch (err) {
+    console.warn("[Normalize] Error:", err.message);
     return cleaned;
+  }
+}
+
+/* ---------------------------------------------------------
+   EXPORT: RAG ANSWER GENERATOR
+   Synthesizes answer from specific retrieved context.
+--------------------------------------------------------- */
+export async function generateAnswerFromContext(userQuery, contextItems) {
+  if (!contextItems || contextItems.length === 0) {
+    return "I couldn't find specific information about that in my database.";
+  }
+
+  // Format context for the LLM
+  const contextString = contextItems
+    .map((item, idx) => `FACT ${idx + 1}:\nQuestion: "${item.question_text}"\nAnswer: "${item.answer_text}"`)
+    .join("\n\n");
+
+  const inst = `
+You are a helpful school assistant. Use the FACTS below to answer the user's question.
+
+USER QUESTION: "${userQuery}"
+
+AVAILABLE FACTS:
+${contextString}
+
+INSTRUCTIONS:
+1. Find the FACT that best answers the specific user question.
+2. Synthesize a SINGLE cohesive answer. Do not just list separate facts one after another.
+3. If the specific information is NOT in the facts, say "I don't have that specific detail." (Do not make up info).
+4. IGNORE facts that are irrelevant to the specific question.
+   - Example: If user asks for "website URL" and you have facts about "email", ignore the email fact.
+5. Provide a direct, polite answer.
+
+Answer:
+`;
+
+  try {
+    const out = await callGemini(userQuery, inst);
+    if (!out) throw new Error("Gemini returned empty response (Rate Limit or Error)");
+    // Remove markdown formatting (**bold**, *italic*)
+    return out.replace(/\*\*/g, "").replace(/\*/g, "").replace(/__/g, "").trim();
+  } catch (err) {
+    console.error("[Gemini RAG] Error:", err.message);
+    // Fallback: return the first match's answer
+    return contextItems[0]?.answer_text || "I'm having trouble processing that right now.";
   }
 }
 
@@ -451,30 +453,18 @@ Return ONLY the final answer text.
 /* ---------------------------------------------------------
    EXPORT: EMBEDDINGS
 --------------------------------------------------------- */
+/* ---------------------------------------------------------
+   EXPORT: EMBEDDINGS (SDK Version)
+--------------------------------------------------------- */
 export async function embedText(text) {
   if (!ENV.GEMINI_API_KEY) return [];
 
   try {
-    const res = await fetch(
-      `${BASE_URL}/${EMBED_MODEL}:embedContent?key=${ENV.GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content: { parts: [{ text }] },
-        }),
-      }
-    );
-
-    if (!res.ok) {
-      console.error("[Gemini] embedText HTTP error:", res.status);
-      return [];
-    }
-
-    const data = await res.json();
-    return data?.embedding?.values || [];
+    const model = genAI.getGenerativeModel({ model: EMBED_MODEL });
+    const result = await model.embedContent(text);
+    return result.embedding.values || [];
   } catch (err) {
-    console.error("[Gemini] embedText error:", err);
+    console.error("[Gemini] embedText error:", err.message);
     return [];
   }
 }

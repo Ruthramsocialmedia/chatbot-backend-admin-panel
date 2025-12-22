@@ -1,11 +1,12 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { normalizeToMeaning, generateAnswerFromContext, answerGeneralQuestion } from "./geminiService.js";
 import dotenv from 'dotenv';
 dotenv.config();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const embeddingModel = genAI.getGenerativeModel({ model: "text-embedding-004" });
 // Use Configured Model or Fallback to Stable 1.5 Flash
-const modelName = process.env.GEMINI_MODEL || "gemini-pro";
+const modelName = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const generativeModel = genAI.getGenerativeModel({ model: modelName });
 
 export const aiService = {
@@ -62,5 +63,10 @@ export const aiService = {
             console.error('Batch Embedding Error:', error);
             throw error;
         }
-    }
+    },
+
+    // RAG Functions
+    normalizeToMeaning,
+    generateAnswerFromContext,
+    answerGeneralQuestion
 };
