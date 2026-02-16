@@ -17,7 +17,7 @@ import { keyManager } from "../utils/keyManager.js";
 // Initialize genAI dynamically in callGemini to allow key rotation
 // const genAI = new GoogleGenerativeAI(ENV.GEMINI_API_KEY); <--- REMOVED static init
 const CHAT_MODEL = ENV.GEMINI_MODEL || "gemini-flash-latest";
-const EMBED_MODEL = "gemini-embedding-001";
+const EMBED_MODEL = "text-embedding-004";
 
 /* ---------------------------------------------------------
    CORE GEMINI CALLER (SDK Version)
