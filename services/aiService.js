@@ -55,7 +55,7 @@ export const aiService = {
             const cleanText = text.replace(/\n/g, ' ');
 
             const genAI = new GoogleGenerativeAI(currentKey);
-            const embeddingModel = genAI.getGenerativeModel({ model: "text-embedding-004" });
+            const embeddingModel = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
 
             const result = await embeddingModel.embedContent({
                 content: { parts: [{ text: cleanText }] },
