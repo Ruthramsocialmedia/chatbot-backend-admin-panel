@@ -24,6 +24,15 @@ app.get("/", (req, res) => {
 app.post("/api/publish", publishIntent);
 app.post("/api/chat", chatHandler);
 app.post("/api/scan-duplicates", scanDuplicates);
+app.post("/api/refresh-vocab", async (req, res) => {
+  try {
+    const { vocabService } = await import('./services/vocabService.js');
+    const result = await vocabService.refresh();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.listen(ENV.PORT, () => {
   console.log(`🚀 Backend listening on http://localhost:${ENV.PORT}`);

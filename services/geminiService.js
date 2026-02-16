@@ -10,97 +10,17 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import { ENV } from "../config/env.js";
 import { fileURLToPath } from "url";
 import { supabaseAdmin } from "./supabaseService.js";
+import { vocabService } from "./vocabService.js";
+import { levenshteinDistance } from "../utils/stringUtils.js";
+import { keyManager } from "../utils/keyManager.js";
 
-const genAI = new GoogleGenerativeAI(ENV.GEMINI_API_KEY);
+// Initialize genAI dynamically in callGemini to allow key rotation
+// const genAI = new GoogleGenerativeAI(ENV.GEMINI_API_KEY); <--- REMOVED static init
 const CHAT_MODEL = ENV.GEMINI_MODEL || "gemini-flash-latest";
-const EMBED_MODEL = "text-embedding-004";
-
-let VOCAB_SET = null;
-let VOCAB_WORDS = null;
+const EMBED_MODEL = "gemini-embedding-001";
 
 /* ---------------------------------------------------------
-   LOAD VOCAB (from Database)
---------------------------------------------------------- */
-async function loadVocabOnce() {
-  if (VOCAB_SET) return;
-
-  try {
-    const set = new Set();
-
-    // Fetch Questions
-    const { data: questions, error: qError } = await supabaseAdmin
-      .from('questions')
-      .select('question_text');
-
-    if (qError) console.error("[GeminiService] Error fetching questions:", qError);
-    else {
-      questions?.forEach(q => {
-        processTextToVocab(q.question_text, set);
-      });
-    }
-
-    // Fetch Intents
-    const { data: intents, error: iError } = await supabaseAdmin
-      .from('intents')
-      .select('name');
-
-    if (iError) console.error("[GeminiService] Error fetching intents:", iError);
-    else {
-      intents?.forEach(i => {
-        processTextToVocab(i.name, set);
-      });
-    }
-
-    VOCAB_SET = set;
-    VOCAB_WORDS = Array.from(set);
-    console.log(
-      `[GeminiService] Loaded ${VOCAB_WORDS.length} vocabulary words from DB.`
-    );
-  } catch (err) {
-    console.error("[GeminiService] Failed to load vocabulary:", err);
-    VOCAB_SET = new Set();
-    VOCAB_WORDS = [];
-  }
-}
-
-function processTextToVocab(text, set) {
-  if (!text) return;
-  text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean)
-    .forEach((t) => {
-      if (t.length >= 3) set.add(t);
-    });
-}
-
-/* ---------------------------------------------------------
-   HELPER: Levenshtein distance
---------------------------------------------------------- */
-function levenshtein(a, b) {
-  const m = a.length;
-  const n = b.length;
-  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost
-      );
-    }
-  }
-  return dp[m][n];
-}
-
-/* ---------------------------------------------------------
-   CORE GEMINI CALLER
+   CORE GEMINI CALLER (SDK Version)
 --------------------------------------------------------- */
 /* ---------------------------------------------------------
    CORE GEMINI CALLER (SDK Version)
@@ -109,15 +29,15 @@ const COOLDOWN_MS = 60 * 1000; // 1 minute cooldown
 let last429Time = 0;
 
 async function callGemini(prompt, instruction = "") {
-  // CIRCUIT BREAKER: Check cooldown
-  if (Date.now() - last429Time < COOLDOWN_MS) {
-    console.warn("[Gemini] Circuit Breaker Active. Skipping call (cooling down).");
-    return "";
-  }
+  // CIRCUIT BREAKER: Check cooldown (Only if ALL keys are exhausted/rate-limited, but for now simple global check)
+  // With multi-key, we might not need global cooldown unless ALL keys fail.
+  // For simplicity: If keyManager returns null (all blocked), we wait.
 
-  if (!ENV.GEMINI_API_KEY) return "";
+  const currentKey = keyManager.getKey();
+  if (!currentKey) return "";
 
   try {
+    const genAI = new GoogleGenerativeAI(currentKey);
     const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
 
     // Construct prompt with instruction
@@ -137,9 +57,17 @@ async function callGemini(prompt, instruction = "") {
     return response.text().trim();
   } catch (err) {
     if (err.message && (err.message.includes("429") || err.message.includes("Quota exceeded"))) {
-      console.warn(`[Gemini] Rate Limit (429) Hit. Activating Circuit Breaker for ${COOLDOWN_MS / 1000}s.`);
-      last429Time = Date.now();
-      return "";
+      console.warn(`[Gemini] Rate Limit (429) on key ${keyManager.getCurrentKeyMasked()}`);
+
+      // ROTATE KEY AND RETRY
+      if (keyManager.rotate()) {
+        console.log(`[Gemini] Retrying with new key...`);
+        return callGemini(prompt, instruction); // Recursive retry with new key
+      } else {
+        // No more keys or rotation failed
+        console.error("[Gemini] All keys exhausted/rate limited.");
+        return "";
+      }
     }
     console.error("[Gemini] callGemini error:", err.message);
     return "";
@@ -168,20 +96,23 @@ function preClean(text) {
    - "hostelstudents" → "hostel students"
 --------------------------------------------------------- */
 function splitMergedWords(text) {
-  if (!VOCAB_WORDS || !VOCAB_WORDS.length) return text;
+  const vocabWords = vocabService.getArray();
+  const vocabSet = vocabService.getSet();
+
+  if (!vocabWords || !vocabWords.length) return text;
 
   return text
     .split(/\s+/)
     .map((word) => {
       const lower = word.toLowerCase();
-      if (VOCAB_SET.has(lower)) return word;
+      if (vocabSet.has(lower)) return word;
 
       // Try splitting into 2 vocab words
       for (let i = 3; i < lower.length - 2; i++) {
         const left = lower.slice(0, i);
         const right = lower.slice(i);
 
-        if (VOCAB_SET.has(left) && VOCAB_SET.has(right)) {
+        if (vocabSet.has(left) && vocabSet.has(right)) {
           return `${left} ${right}`;
         }
       }
@@ -198,7 +129,10 @@ function splitMergedWords(text) {
      to avoid "text" → "test" mistakes.
 --------------------------------------------------------- */
 function localSpellFix(text) {
-  if (!VOCAB_WORDS || !VOCAB_WORDS.length) return text;
+  const vocabWords = vocabService.getArray();
+  const vocabSet = vocabService.getSet();
+
+  if (!vocabWords || !vocabWords.length) return text;
 
   return text
     .split(/\s+/)
@@ -209,13 +143,13 @@ function localSpellFix(text) {
       if (!/^[a-z]+$/.test(t) || t.length < 5) return token;
 
       // already known word
-      if (VOCAB_SET.has(t)) return token;
+      if (vocabSet.has(t)) return token;
 
       let best = t;
       let bestDist = Infinity;
 
-      for (const v of VOCAB_WORDS) {
-        const d = levenshtein(t, v);
+      for (const v of vocabWords) {
+        const d = levenshteinDistance(t, v);
         if (d < bestDist) {
           bestDist = d;
           best = v;
@@ -238,6 +172,26 @@ function localSpellFix(text) {
 }
 
 /* ---------------------------------------------------------
+   EXPORT: QUICK CORRECTION (Local Only - FAST)
+   Pipeline:
+   1) preClean
+   2) splitMergedWords
+   3) localSpellFix
+--------------------------------------------------------- */
+export async function quickCorrection(text) {
+  if (!text) return "";
+
+  // Ensure vocab is loaded
+  await vocabService.load();
+
+  let processed = preClean(text);
+  processed = splitMergedWords(processed);
+  processed = localSpellFix(processed);
+
+  return processed;
+}
+
+/* ---------------------------------------------------------
    EXPORT: SPELLING CORRECTION (IUI v2.5)
    Pipeline:
    1) preClean
@@ -249,7 +203,7 @@ export async function correctSpelling(text) {
   if (!text) return "";
 
   // ✅ FIX: Ensure vocab is loaded before processing
-  await loadVocabOnce();
+  await vocabService.load();
 
   // 1. basic cleaning
   let processed = preClean(text);
@@ -457,14 +411,26 @@ Return ONLY the final answer text.
    EXPORT: EMBEDDINGS (SDK Version)
 --------------------------------------------------------- */
 export async function embedText(text) {
-  if (!ENV.GEMINI_API_KEY) return [];
+  const currentKey = keyManager.getKey();
+  if (!currentKey) return [];
 
   try {
+    const genAI = new GoogleGenerativeAI(currentKey);
     const model = genAI.getGenerativeModel({ model: EMBED_MODEL });
-    const result = await model.embedContent(text);
+    const result = await model.embedContent({
+      content: { parts: [{ text }] },
+      outputDimensionality: 768   // Match existing DB vectors
+    });
     return result.embedding.values || [];
   } catch (err) {
     console.error("[Gemini] embedText error:", err.message);
+    if (err.message && (err.message.includes("429") || err.message.includes("Quota exceeded"))) {
+      console.warn(`[Gemini Embed] Rate Limit on key ${keyManager.getCurrentKeyMasked()}`);
+      if (keyManager.rotate()) {
+        console.log(`[Gemini Embed] Retrying with new key...`);
+        return embedText(text); // Recursive retry
+      }
+    }
     return [];
   }
 }

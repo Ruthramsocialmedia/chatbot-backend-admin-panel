@@ -33,10 +33,17 @@ export const publishIntent = async (req, res) => {
                 console.error(`[BulkPublish] Failed for ${id}:`, err.message);
                 results.failed++;
                 results.details.push({ id, status: 'failed', error: err.message });
+
+                // CRITICAL ERROR CHECK: 429 (Rate Limit) or 403 (Forbidden/Leaked Key)
+                if (err.message.includes('429') || err.message.includes('Quota exceeded') || err.message.includes('403')) {
+                    console.error(`[BulkPublish] 🚨 CRITICAL API ERROR. Aborting remaining intents to prevent collapse.`);
+                    results.aborted = true;
+                    break; // STOP THE LOOP
+                }
             }
         }
 
-        return res.json({ success: true, ...results });
+        return res.json({ success: true, results });
 
     } catch (err) {
         console.error('[BulkPublish] Critical Error:', err);
@@ -55,8 +62,16 @@ async function processSingleIntent(intentId) {
 
     if (iErr || !intent) throw new Error('Intent not found');
 
-    // 2. State Transition (Draft -> Published)
-    // Validate 9 Qs + 1 A using DB validation triggers
+    // 3. Fetch Active Questions
+    const { data: questions, error: qErr } = await supabaseAdmin
+        .from('questions')
+        .select('id, question_text')
+        .eq('intent_id', intentId)
+        .eq('is_active', true);
+
+    if (qErr || !questions || questions.length === 0) throw new Error('No active questions found');
+
+    // 4. Update Status to Published FIRST (to satisfy DB constraint)
     if (intent.status === 'draft') {
         const { error: updateErr } = await supabaseAdmin
             .from('intents')
@@ -66,37 +81,40 @@ async function processSingleIntent(intentId) {
         if (updateErr) throw new Error('Validation Failed: ' + updateErr.message);
     }
 
-    // 3. Fetch Active Questions
-    const { data: questions, error: qErr } = await supabaseAdmin
-        .from('questions')
-        .select('id, question_text')
-        .eq('intent_id', intentId)
-        .eq('is_active', true)
-        .eq('is_active', true);
-
-    if (qErr || !questions || questions.length === 0) throw new Error('No active questions found');
-
-    // 4. Generate Embeddings
-    const embeddingModel = "text-embedding-004"; // Gemini
+    // 5. Generate Embeddings (Atomic / Revert on Fail)
+    const embeddingModel = "gemini-embedding-001"; // Gemini
     let embeddedCount = 0;
 
-    for (const q of questions) {
-        const vector = await aiService.generateEmbedding(q.question_text);
-        if (vector) {
-            const { error: insErr } = await supabaseAdmin.from('embeddings').upsert({
-                intent_id: intentId,
-                question_id: q.id,
-                model: embeddingModel,
-                dims: vector.length,
-                vector: vector
-            }, { onConflict: 'question_id, model' });
+    try {
+        for (const q of questions) {
+            const vector = await aiService.generateEmbedding(q.question_text);
+            if (vector) {
+                const { error: insErr } = await supabaseAdmin.from('embeddings').upsert({
+                    intent_id: intentId,
+                    question_id: q.id,
+                    model: embeddingModel,
+                    dims: vector.length,
+                    vector: vector
+                }, { onConflict: 'question_id, model' });
 
-            if (insErr) {
-                console.error(`DB Error QID ${q.id}:`, insErr);
-            } else {
-                embeddedCount++;
+                if (insErr) {
+                    console.error(`DB Error QID ${q.id}:`, insErr);
+                } else {
+                    embeddedCount++;
+                }
             }
         }
+    } catch (err) {
+        // ROLLBACK: Revert to Draft and cleanup
+        console.warn(`[Publish] Failed during embedding for ${intentId}. Rolling back to Draft...`);
+
+        // 1. Delete partial embeddings
+        await supabaseAdmin.from('embeddings').delete().eq('intent_id', intentId);
+
+        // 2. Revert status
+        await supabaseAdmin.from('intents').update({ status: 'draft' }).eq('id', intentId);
+
+        throw err; // Re-throw to trigger abort in parent
     }
 
     return { slug: intent.slug, count: embeddedCount };
