@@ -6,13 +6,14 @@ import { aiIntentRouter } from './aiIntentRouter.js';
 // controllers/chatController.js
 
 
-// Helper: Extract clean topic label from question
-// Helper: Extract clean topic label from question
-function formatTopicLabel(question) {
-  // Simple: Return the full question without question mark
-  // This avoids "Students Get Hot" issues
-  return question.replace(/\?$/, '').trim();
+// Helper: Format times for clean TTS pronunciation (e.g. 9.00 AM - 6.00 PM -> 9:00 AM to 6:00 PM)
+function normalizeSpeechTimes(str) {
+  if (!str) return str;
+  return str
+    .replace(/(\b\d{1,2})\.(\d{2})\s*(AM|PM|am|pm)\b/g, '$1:$2 $3')
+    .replace(/(\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\s*[-–—]\s*(\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b)/gi, '$1 to $2');
 }
+
 
 export const chatHandler = async (req, res) => {
   // Fix: Frontend sends 'question', not 'message'
@@ -182,36 +183,25 @@ export const chatHandler = async (req, res) => {
         matches = [];
       } else {
 
-        // --- AMBIGUITY CLARIFICATION ---
-        // If top 2 matches are very close in similarity, ask user to clarify
-        if (enrichedMatches.length >= 2) {
-          const top1 = enrichedMatches[0];
-          const top2 = enrichedMatches[1];
-          const similarityGap = Math.abs(top1.similarity - top2.similarity);
+        // E. Synthesize Natural Answer via Gemini RAG using the top relevant matches
+        const topMatches = enrichedMatches.slice(0, 3);
+        console.log(`[Chat] Synthesizing RAG answer from ${topMatches.length} matches...`);
 
-          // If top 2 are within 0.05 of each other AND both above floor, ask clarification
-          if (similarityGap < 0.05 && top2.similarity >= MIN_CONFIDENCE_FLOOR) {
-            const topic1 = formatTopicLabel(top1.question_text);
-            const topic2 = formatTopicLabel(top2.question_text);
+        try {
+          const ragAnswer = await aiService.generateAnswerFromContext(correctedMessage || message, topMatches);
+          const finalAnswer = normalizeSpeechTimes(ragAnswer || bestMatch.answer_text);
 
-            // Only ask if they are actually different topics
-            if (topic1.toLowerCase() !== topic2.toLowerCase()) {
-              console.log(`[Chat] Ambiguity Detected: "${topic1}" vs "${topic2}" (gap: ${similarityGap.toFixed(3)})`);
-              return res.json({
-                answer: `I found multiple matches. Did you mean:\n\n• ${topic1}\n• ${topic2}\n\nPlease be more specific so I can help you better.`,
-                matched_question: "Ambiguity Clarification",
-                normalizedQuestion: correctedMessage,
-                confidence: top1.similarity
-              });
-            }
-          }
-        }
-
-        // E. Return the Single Winner (Direct DB Answer — NO LLM generation)
-        if (bestMatch && bestMatch.answer_text) {
-          console.log(`[Chat] Returning direct DB answer. Confidence: ${bestMatch.similarity.toFixed(3)}`);
+          console.log(`[Chat] Returning RAG answer. Top Match: "${bestMatch.question_text}" (${bestMatch.similarity.toFixed(3)})`);
           return res.json({
-            answer: bestMatch.answer_text,
+            answer: finalAnswer,
+            matched_question: bestMatch.question_text,
+            normalizedQuestion: correctedMessage,
+            confidence: bestMatch.similarity
+          });
+        } catch (ragErr) {
+          console.warn('[Chat] RAG synthesis fallback to direct answer:', ragErr.message);
+          return res.json({
+            answer: normalizeSpeechTimes(bestMatch.answer_text),
             matched_question: bestMatch.question_text,
             normalizedQuestion: correctedMessage,
             confidence: bestMatch.similarity
@@ -220,10 +210,10 @@ export const chatHandler = async (req, res) => {
       } // End of Domain Guard Else
     } // End of if (matches)
 
-    // 6. Fallback — Fixed string, NO LLM generation
-    console.log('[Chat] No match found above threshold. Returning fixed fallback.');
+    // 6. Fallback — Polite campus guide response
+    console.log('[Chat] No match found above threshold. Returning fallback.');
     return res.json({
-      answer: "I can only answer Montfort School related questions. Please try asking about admissions, fees, hostel, transport, or school facilities.",
+      answer: "I don't have that specific detail in our college records. You can ask me about admissions, courses, fees, hostel, campus facilities, or ask me to navigate to any tour location.",
       confidence: 0,
       normalizedQuestion: correctedMessage
     });

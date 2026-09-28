@@ -56,8 +56,8 @@ async function callGemini(prompt, instruction = "") {
     const response = await result.response;
     return response.text().trim();
   } catch (err) {
-    if (err.message && (err.message.includes("429") || err.message.includes("Quota exceeded"))) {
-      console.warn(`[Gemini] Rate Limit (429) on key ${keyManager.getCurrentKeyMasked()}`);
+    if (err.message && (err.message.includes("429") || err.message.includes("Quota exceeded") || err.message.includes("503") || err.message.includes("500"))) {
+      console.warn(`[Gemini] Temporary error / rate limit on key ${keyManager.getCurrentKeyMasked()}: ${err.message.substring(0, 60)}...`);
 
       // ROTATE KEY AND RETRY
       if (keyManager.rotate()) {
@@ -334,7 +334,8 @@ export async function generateAnswerFromContext(userQuery, contextItems) {
     .join("\n\n");
 
   const inst = `
-You are a helpful school assistant. Use the FACTS below to answer the user's question.
+You are the friendly, official AI tour guide and campus assistant for Thiagarajar College.
+Use the FACTS below to answer the user's question accurately, warmly, and concisely.
 
 USER QUESTION: "${userQuery}"
 
@@ -342,25 +343,34 @@ AVAILABLE FACTS:
 ${contextString}
 
 INSTRUCTIONS:
-1. Find the FACT that best answers the specific user question.
-2. Synthesize a SINGLE cohesive answer. Do not just list separate facts one after another.
-3. If the specific information is NOT in the facts, say "I don't have that specific detail." (Do not make up info).
-4. IGNORE facts that are irrelevant to the specific question.
-   - Example: If user asks for "website URL" and you have facts about "email", ignore the email fact.
-5. Provide a direct, polite answer.
+1. Synthesize a single cohesive, natural answer in 1 to 2 clear spoken sentences.
+2. Directly answer what the user asked. Do not list separate facts or use bullet points.
+3. Sound conversational and warm, suitable for spoken voice narration.
+4. Format all times cleanly for speech narration (e.g. "9:00 AM to 6:00 PM" instead of "9.00 AM - 6.00 PM").
+5. Do NOT use markdown formatting (no **bold**, no *italic*), and do NOT output raw URLs or bullet lists.
+6. If the specific detail is not in the facts, say: "I don't have that specific detail in our college records, but you can inquire at the admissions office or explore our campus facilities."
 
 Answer:
 `;
 
+  const normalizeSpeechTimes = (str) => {
+    if (!str) return str;
+    return str
+      .replace(/(\b\d{1,2})\.(\d{2})\s*(AM|PM|am|pm)\b/g, '$1:$2 $3')
+      .replace(/(\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\s*[-–—]\s*(\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b)/gi, '$1 to $2');
+  };
+
   try {
     const out = await callGemini(userQuery, inst);
     if (!out) throw new Error("Gemini returned empty response (Rate Limit or Error)");
-    // Remove markdown formatting (**bold**, *italic*)
-    return out.replace(/\*\*/g, "").replace(/\*/g, "").replace(/__/g, "").trim();
+    // Remove markdown formatting (**bold**, *italic*) and format times cleanly
+    const cleaned = out.replace(/\*\*/g, "").replace(/\*/g, "").replace(/__/g, "").trim();
+    return normalizeSpeechTimes(cleaned);
   } catch (err) {
     console.error("[Gemini RAG] Error:", err.message);
-    // Fallback: return the first match's answer
-    return contextItems[0]?.answer_text || "I'm having trouble processing that right now.";
+    // Fallback: return the first match's answer with normalized times
+    const fallbackAnswer = contextItems[0]?.answer_text || "I'm having trouble processing that right now.";
+    return normalizeSpeechTimes(fallbackAnswer);
   }
 }
 
