@@ -344,8 +344,8 @@ ${contextString}
 
 INSTRUCTIONS:
 1. Synthesize a single cohesive, natural answer in 1 to 2 clear spoken sentences.
-2. Directly answer what the user asked. Do not list separate facts or use bullet points.
-3. Sound conversational and warm, suitable for spoken voice narration.
+2. Deliver the factual answer directly. Do NOT start with conversational greetings, pleasantries, or filler phrases (such as 'Hello there!', 'Welcome to Thiagarajar College!', 'Hi there!', 'Certainly!').
+3. Directly answer what the user asked. Do not list separate facts or use bullet points.
 4. Format all times cleanly for speech narration (e.g. "9:00 AM to 6:00 PM" instead of "9.00 AM - 6.00 PM").
 5. Do NOT use markdown formatting (no **bold**, no *italic*), and do NOT output raw URLs or bullet lists.
 6. If the specific detail is not in the facts, say: "I don't have that specific detail in our college records, but you can inquire at the admissions office or explore our campus facilities."
@@ -363,8 +363,9 @@ Answer:
   try {
     const out = await callGemini(userQuery, inst);
     if (!out) throw new Error("Gemini returned empty response (Rate Limit or Error)");
-    // Remove markdown formatting (**bold**, *italic*) and format times cleanly
-    const cleaned = out.replace(/\*\*/g, "").replace(/\*/g, "").replace(/__/g, "").trim();
+    // Remove markdown formatting (**bold**, *italic*), strip opening greeting filler, and format times cleanly
+    let cleaned = out.replace(/\*\*/g, "").replace(/\*/g, "").replace(/__/g, "").trim();
+    cleaned = cleaned.replace(/^(hello there[!.,]|welcome to [^!.,]+[!.,]|hi there[!.,]|hello[!.,]|greetings[!.,])\s*/i, "");
     return normalizeSpeechTimes(cleaned);
   } catch (err) {
     console.error("[Gemini RAG] Error:", err.message);
